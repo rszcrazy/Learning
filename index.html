@@ -365,18 +365,29 @@
 
         // Firebase Configuration (Uses environment variables in this specific container)
         const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-quiz-app';
-        let firebaseConfig = {};
+        let firebaseConfig = null;
+        let isCloudEnabled = false;
+
         try {
-            firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : { projectId: "dummy-project" };
+            if (typeof __firebase_config !== 'undefined' && __firebase_config) {
+                firebaseConfig = JSON.parse(__firebase_config);
+                isCloudEnabled = !!(firebaseConfig && firebaseConfig.apiKey);
+            }
         } catch (e) {
             console.error("Config error:", e);
         }
 
-        const app = initializeApp(firebaseConfig);
-        const auth = getAuth(app);
-        const db = getFirestore(app);
-        
+        let app, auth, db;
         let userId = null;
+
+        if (isCloudEnabled) {
+            app = initializeApp(firebaseConfig);
+            auth = getAuth(app);
+            db = getFirestore(app);
+        } else {
+            console.warn("Firebase API key missing. Running in local In-Memory mode.");
+            userId = 'local-dummy-user'; // Mock user ID for local mode
+        }
         
         // App State
         let allQuestions = [];
@@ -384,6 +395,12 @@
         let currentLevelQuestions = [];
         let timerInterval;
         let currentQuestionTimeLeft = 30;
+
+        // Mock Database for when running locally outside the platform
+        const localDB = {
+            students: {},
+            questions: []
+        };
 
         // Default Questions (Ensuring minimum 10 per level for the first 2 levels)
         const defaultQuestions = [
@@ -426,6 +443,14 @@
         setInterval(spawnFloatingEmoji, 1000);
 
         async function initAuth() {
+            if (!isCloudEnabled) {
+                // Running locally without Firebase
+                await loadAllQuestions();
+                document.getElementById('app').classList.remove('hidden');
+                showScreen('main-menu');
+                return;
+            }
+
             try {
                 if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
                     await signInWithCustomToken(auth, __initial_auth_token);
@@ -438,14 +463,16 @@
             }
         }
 
-        onAuthStateChanged(auth, async (user) => {
-            if (user) {
-                userId = user.uid;
-                await loadAllQuestions();
-                document.getElementById('app').classList.remove('hidden');
-                showScreen('main-menu');
-            }
-        });
+        if (isCloudEnabled) {
+            onAuthStateChanged(auth, async (user) => {
+                if (user) {
+                    userId = user.uid;
+                    await loadAllQuestions();
+                    document.getElementById('app').classList.remove('hidden');
+                    showScreen('main-menu');
+                }
+            });
+        }
 
         // Start Auth
         initAuth();
@@ -454,6 +481,12 @@
             if (!userId) return;
             allQuestions = [...defaultQuestions]; // Start with defaults
             
+            if (!isCloudEnabled) {
+                allQuestions.push(...localDB.questions);
+                console.log(`Loaded ${allQuestions.length} total questions (Local Mode).`);
+                return;
+            }
+
             try {
                 // Fetch dynamic questions added by Admin
                 // Path Rule 1: Public data collection
@@ -488,15 +521,34 @@
         async function loadAdminData() {
             if(!userId) return;
             try {
+                const tableBody = document.getElementById('students-table-body');
+                tableBody.innerHTML = '';
+                let studentCount = 0;
+
+                if (!isCloudEnabled) {
+                    // Load from local in-memory mock DB
+                    for (const key in localDB.students) {
+                        const data = localDB.students[key];
+                        studentCount++;
+                        const tr = document.createElement('tr');
+                        tr.className = 'hover:bg-gray-50 transition-colors';
+                        tr.innerHTML = `
+                            <td class="px-6 py-4 font-bold text-gray-800">${data.name}</td>
+                            <td class="px-6 py-4 text-gray-600">Class ${data.classId}</td>
+                            <td class="px-6 py-4 text-indigo-600 font-bold">Level ${data.level}</td>
+                            <td class="px-6 py-4 text-green-600 font-bold">${data.totalScore}</td>
+                        `;
+                        tableBody.appendChild(tr);
+                    }
+                    document.getElementById('total-students').innerText = studentCount;
+                    document.getElementById('total-questions-stats').innerText = allQuestions.length;
+                    return;
+                }
+
                 // Fetch all students (Public collection as per Rule 1 for collaborative apps)
                 const sRef = collection(db, 'artifacts', appId, 'public', 'data', 'students');
                 const sSnap = await getDocs(sRef);
                 
-                const tableBody = document.getElementById('students-table-body');
-                tableBody.innerHTML = '';
-                
-                let studentCount = 0;
-
                 sSnap.forEach(doc => {
                     const data = doc.data();
                     studentCount++;
@@ -562,6 +614,22 @@
 
             const newQ = { level, text, options, answer };
 
+            if (!isCloudEnabled) {
+                localDB.questions.push(newQ);
+                allQuestions.push(newQ);
+                document.getElementById('total-questions-stats').innerText = allQuestions.length;
+                showModal("Success!", `Question added to Level ${level} successfully (Local Mode)!`, "✅");
+                
+                // Clear form
+                document.getElementById('new-q-text').value = '';
+                document.getElementById('new-q-opt1').value = '';
+                document.getElementById('new-q-opt2').value = '';
+                document.getElementById('new-q-opt3').value = '';
+                document.getElementById('new-q-opt4').value = '';
+                document.getElementById('new-q-answer').value = '';
+                return;
+            }
+
             try {
                 // Save to global pool
                 const qRef = collection(db, 'artifacts', appId, 'public', 'data', 'questions');
@@ -616,6 +684,25 @@
                  return;
             }
 
+            if (!isCloudEnabled) {
+                if (localDB.students[safeNameId]) {
+                    studentData = localDB.students[safeNameId];
+                    showModal("Welcome Back!", `Resuming from Level ${studentData.level}, ${studentData.name}!`, "👋");
+                } else {
+                    studentData = { 
+                        name: name, 
+                        classId: studentClass, 
+                        level: 1, 
+                        totalScore: 0,
+                        questionsAnsweredInLevel: 0,
+                        currentLevelScore: 0
+                    };
+                    localDB.students[safeNameId] = studentData;
+                }
+                prepareLevel();
+                return;
+            }
+
             try {
                 // Fetch student from Public collection (so Admin can see them)
                 const docRef = doc(db, 'artifacts', appId, 'public', 'data', 'students', safeNameId);
@@ -647,6 +734,12 @@
         async function saveStudentProgress() {
             if (!userId || !studentData) return;
             const safeNameId = studentData.name.toLowerCase().replace(/[^a-z0-9]/g, '');
+
+            if (!isCloudEnabled) {
+                localDB.students[safeNameId] = studentData;
+                return;
+            }
+
             const docRef = doc(db, 'artifacts', appId, 'public', 'data', 'students', safeNameId);
             try {
                 await updateDoc(docRef, {
